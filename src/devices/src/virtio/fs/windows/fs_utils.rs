@@ -39,6 +39,9 @@ pub fn win_err_to_linux(e: io::Error) -> io::Error {
             223 => libc::EFBIG,               // ERROR_FILE_TOO_LARGE
             145 => libc::ENOTEMPTY,           // ERROR_DIR_NOT_EMPTY context
 
+            // ERROR_CANT_RESOLVE_FILENAME: a reparse point on the way (OBJ_DONT_REPARSE)
+            1921 => libc::ELOOP,
+
             39 | 112 => libc::ENOSPC, // ERROR_HANDLE_DISK_FULL / ERROR_DISK_FULL
             25 | 132 => libc::ESPIPE, // ERROR_SEEK / ERROR_SEEK_ON_DEVICE (Illegal seek)
 

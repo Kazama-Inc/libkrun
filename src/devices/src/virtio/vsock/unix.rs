@@ -935,7 +935,7 @@ const ACCEPTOR_FAMILY: Family = Family::Unix;
 #[cfg(windows)]
 const ACCEPTOR_FAMILY: Family = Family::Inet;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::virtio::queue::tests::VirtQueue as TestQueue;
