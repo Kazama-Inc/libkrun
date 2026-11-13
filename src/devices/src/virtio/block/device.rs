@@ -1084,7 +1084,8 @@ impl VmmExitObserver for Block {
     }
 }
 
-#[cfg(test)]
+// utils::tempfile is unix-only.
+#[cfg(all(test, unix))]
 mod overlay_tests {
     use super::*;
     use imago::storage::drivers::CommonStorageHelper;
