@@ -193,6 +193,7 @@ impl Fs {
             read_only,
             override_stat,
             false,
+            false,
             live,
             virtual_entries,
         )
@@ -200,7 +201,9 @@ impl Fs {
 
     /// [`Self::new`] with the share options that have no default worth a
     /// positional argument: `negative_entries` lets the guest keep a missing
-    /// name for a second (see `passthrough::Config::negative_timeout`).
+    /// name for a second (see `passthrough::Config::negative_timeout`);
+    /// `host_owner` reports files with no recorded owner as a non-root user on
+    /// Windows (see `passthrough::Config::default_owner`).
     #[allow(clippy::too_many_arguments)]
     pub fn new_with(
         fs_id: String,
@@ -209,6 +212,7 @@ impl Fs {
         read_only: bool,
         override_stat: bool,
         negative_entries: bool,
+        host_owner: bool,
         live: bool,
         virtual_entries: Vec<VirtualDirEntry>,
     ) -> super::Result<Fs> {
@@ -228,8 +232,12 @@ impl Fs {
             } else {
                 Duration::ZERO
             },
+            #[cfg(target_os = "windows")]
+            default_owner: host_owner.then_some(passthrough::HOST_OWNER),
             ..Default::default()
         });
+        #[cfg(not(target_os = "windows"))]
+        let _ = host_owner;
 
         Ok(Fs {
             avail_features,

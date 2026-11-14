@@ -3451,6 +3451,7 @@ fn attach_fs_devices(
                 config.read_only,
                 config.override_stat,
                 config.negative_entries,
+                config.host_owner,
                 config.live,
                 config.virtual_entries.clone(),
             )
