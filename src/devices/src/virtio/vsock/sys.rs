@@ -72,10 +72,27 @@ pub fn peer_hung_up(sock: &Socket) -> bool {
         let ready = unsafe { libc::poll(&mut fd, 1, 0) };
         ready > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
     }
+    // Windows AF_UNIX reports a closed peer as POLLHUP from WSAPoll, also when
+    // the peer wrote data before closing (POLLRDNORM | POLLHUP). Answering
+    // "no" here left every host client that gave up while the guest was not
+    // yet listening retrying its connect up to MAX_CONNECT_RETRIES times: a
+    // host probing a booting guest stacked hundreds of such loops, which
+    // flooded the guest's RX queue with tens of thousands of packets per boot.
     #[cfg(windows)]
     {
-        let _ = sock;
-        false
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, WSAPOLLFD, WSAPoll,
+        };
+        let mut fd = WSAPOLLFD {
+            fd: sock.as_raw_socket() as usize,
+            events: POLLRDNORM as i16,
+            revents: 0,
+        };
+        // SAFETY: one valid WSAPOLLFD for a socket `sock` keeps open; a zero
+        // timeout never blocks.
+        let ready = unsafe { WSAPoll(&mut fd, 1, 0) };
+        ready > 0 && fd.revents & (POLLHUP | POLLERR | POLLNVAL) as i16 != 0
     }
 }
 
