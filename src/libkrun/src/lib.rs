@@ -2834,6 +2834,11 @@ pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
 pub const KRUN_VIRTIOFS_FLAG_LIVE: u32 = 1 << 1;
 /// Let the guest keep a missing name for one second (see `KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES`).
 pub const KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES: u32 = 1 << 2;
+/// Windows: report a file with no recorded owner as owned by uid and gid
+/// 1000 instead of root, so a non-root guest user can be mapped onto a host
+/// directory (see `KRUN_VIRTIOFS_FLAG_HOST_OWNER` in libkrun.h). Ignored on
+/// Linux and macOS, which report the host owner.
+pub const KRUN_VIRTIOFS_FLAG_HOST_OWNER: u32 = 1 << 3;
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
@@ -2849,13 +2854,15 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
     if flags
         & !(KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT
             | KRUN_VIRTIOFS_FLAG_LIVE
-            | KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES)
+            | KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES
+            | KRUN_VIRTIOFS_FLAG_HOST_OWNER)
         != 0
     {
         return -libc::EINVAL;
     }
     let override_stat = flags & KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT != 0;
     let negative_entries = flags & KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES != 0;
+    let host_owner = flags & KRUN_VIRTIOFS_FLAG_HOST_OWNER != 0;
     let live = flags & KRUN_VIRTIOFS_FLAG_LIVE != 0;
     // A live device's mappings into guest memory could not be revoked on
     // detach, so it has no DAX window, and it needs a host root to serve from.
@@ -2910,6 +2917,7 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
                     read_only,
                     override_stat,
                     negative_entries,
+                    host_owner,
                     live,
                     virtual_entries,
                 });
@@ -5113,6 +5121,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     read_only: false,
                     override_stat: false,
                     negative_entries: false,
+                    host_owner: false,
                     live: false,
                     virtual_entries,
                 });

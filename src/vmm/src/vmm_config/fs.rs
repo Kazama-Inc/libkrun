@@ -15,6 +15,9 @@ pub struct FsDeviceConfig {
     /// Let the guest keep a missing name for a second (see the passthrough
     /// `Config::negative_timeout`).
     pub negative_entries: bool,
+    /// Windows: report files with no recorded owner as a non-root user (see
+    /// the passthrough `Config::default_owner`).
+    pub host_owner: bool,
     /// Serve host directories attached and detached at runtime (see
     /// `devices::virtio::fs::live_fs`) instead of one fixed directory.
     pub live: bool,

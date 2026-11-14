@@ -380,6 +380,16 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
    when the host creates a file; without such a watcher a file the host creates
    under a name the guest just looked up appears up to a second late. */
 #define KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES (1 << 2)
+/* Windows: report a file with no recorded owner as owned by uid and gid 1000
+   (KRUN_VIRTIOFS_HOST_OWNER) instead of root. A Windows host has no Unix owner
+   to report, so a host directory otherwise reaches the guest as root:root and a
+   non-root guest user cannot write to it; with a non-root owner the guest can
+   map it to its workload user, as it does for a macOS or Linux host user.
+   Owners the guest records (chown, files it creates) are unaffected. For
+   shares of user files, not of an image tree. Ignored on Linux and macOS,
+   which report the host owner. */
+#define KRUN_VIRTIOFS_FLAG_HOST_OWNER (1 << 3)
+#define KRUN_VIRTIOFS_HOST_OWNER 1000
 
 /**
  * Like krun_add_virtiofs3, with per-share behavior flags (KRUN_VIRTIOFS_FLAG_*).

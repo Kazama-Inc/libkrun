@@ -217,6 +217,10 @@ fn target_stays_inside(depth: usize, target: &[u8]) -> bool {
     true
 }
 
+/// The owner `KRUN_VIRTIOFS_FLAG_HOST_OWNER` reports for files with no
+/// recorded owner: the first regular user of most distributions.
+pub const HOST_OWNER: (u32, u32) = (1000, 1000);
+
 const S_ISUID: u32 = 0o04_000;
 const S_IXGRP: u32 = 0o00_010;
 const S_ISGID: u32 = 0o02_000;
@@ -408,6 +412,15 @@ pub struct Config {
     /// presents ownership from the override xattr.
     pub override_stat: bool,
 
+    /// The owner (uid, gid) reported for a file with no owner recorded in its
+    /// override stream; `None` reports root. A Windows host has no Unix owner
+    /// to give, so a host directory shared as root:root cannot be written by a
+    /// non-root guest user. Reporting a non-root owner lets the guest map it
+    /// onto its workload user (an id-mapped mount, as for a macOS or Linux
+    /// host user). Set for shares of user files (`KRUN_VIRTIOFS_FLAG_HOST_OWNER`),
+    /// never for an image tree, whose files without a record belong to root.
+    pub default_owner: Option<(u32, u32)>,
+
     /// ID of this filesystem to uniquely identify exports.
     pub export_fsid: u64,
     /// Table of exported FDs to share with other subsystems.
@@ -425,6 +438,7 @@ impl Default for Config {
             root_dir: String::from("C:\\"),
             xattr: true,
             override_stat: false,
+            default_owner: None,
             export_fsid: 0,
             export_table: None,
         }
@@ -662,6 +676,7 @@ fn metadata_to_stat64(
     path: &Path,
     n_link: u32,
     root: &Path,
+    default_owner: (u32, u32),
 ) -> stat64 {
     let file_attributes = meta.file_attributes();
 
@@ -699,8 +714,8 @@ fn metadata_to_stat64(
         st_ino: ino,
         st_nlink: nlink,
         st_mode: base_mode as u32,
-        st_uid: 0,
-        st_gid: 0,
+        st_uid: default_owner.0,
+        st_gid: default_owner.1,
         st_rdev: 0,
         st_size: size,
         st_atime: filetime_to_unix_secs(access),
@@ -1610,6 +1625,10 @@ impl PassthroughFs {
     }
 
     /// The shared root, canonical (`\\?\` form).
+    fn default_owner(&self) -> (u32, u32) {
+        self.cfg.default_owner.unwrap_or((0, 0))
+    }
+
     fn root(&self) -> &Path {
         Path::new(&self.cfg.root_dir)
     }
@@ -1718,6 +1737,7 @@ impl PassthroughFs {
             &child_path,
             file_info.n_number_of_links,
             self.root(),
+            self.default_owner(),
         );
 
         let mut attr_flags = 0u32;
@@ -1758,7 +1778,7 @@ impl PassthroughFs {
                                 n_link = info.nNumberOfLinks;
                             }
                         }
-                        let st = metadata_to_stat64(&meta, inode, &path, n_link, self.root());
+                        let st = metadata_to_stat64(&meta, inode, &path, n_link, self.root(), self.default_owner());
                         return Ok((st, self.cfg.attr_timeout));
                     }
                 }
@@ -1773,6 +1793,7 @@ impl PassthroughFs {
             &path,
             file_info.n_number_of_links,
             self.root(),
+            self.default_owner(),
         );
         Ok((st, self.cfg.attr_timeout))
     }
@@ -3653,5 +3674,71 @@ mod escape_tests {
         assert!(!target_stays_inside(5, b"/etc/passwd"));
         assert!(!target_stays_inside(5, br"..\x"));
         assert!(!target_stays_inside(5, b"C:x"));
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn ctx() -> Context {
+        Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        }
+    }
+
+    fn share(name: &str, default_owner: Option<(u32, u32)>) -> (PathBuf, PassthroughFs) {
+        let base = std::env::temp_dir().join(format!("krun-owner-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("dir")).unwrap();
+        fs::write(base.join("file.txt"), "x").unwrap();
+        let cfg = Config {
+            root_dir: base.to_string_lossy().into_owned(),
+            default_owner,
+            ..Default::default()
+        };
+        let pfs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+        pfs.init(FsOptions::empty()).unwrap();
+        (base, pfs)
+    }
+
+    fn owner(st: &stat64) -> (u32, u32) {
+        (st.st_uid, st.st_gid)
+    }
+
+    #[test]
+    fn files_without_a_record_belong_to_root_by_default() {
+        let (base, pfs) = share("root", None);
+        let (st, _) = pfs.getattr(ctx(), fuse::ROOT_ID, None).unwrap();
+        assert_eq!(owner(&st), (0, 0));
+        let e = pfs.lookup(ctx(), fuse::ROOT_ID, &CString::new("file.txt").unwrap()).unwrap();
+        assert_eq!(owner(&e.attr), (0, 0));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_host_owned_share_reports_the_host_owner_until_one_is_recorded() {
+        let (base, pfs) = share("host", Some(HOST_OWNER));
+        let (st, _) = pfs.getattr(ctx(), fuse::ROOT_ID, None).unwrap();
+        assert_eq!(owner(&st), HOST_OWNER, "share root");
+        for name in ["file.txt", "dir"] {
+            let e = pfs.lookup(ctx(), fuse::ROOT_ID, &CString::new(name).unwrap()).unwrap();
+            assert_eq!(owner(&e.attr), HOST_OWNER, "{name}");
+        }
+
+        // An owner the guest records wins.
+        let e = pfs.lookup(ctx(), fuse::ROOT_ID, &CString::new("file.txt").unwrap()).unwrap();
+        let mut attr = e.attr;
+        attr.st_uid = 0;
+        attr.st_gid = 0;
+        let valid = SetattrValid::UID | SetattrValid::GID;
+        let (st, _) = pfs.setattr(ctx(), e.inode, attr, None, valid).unwrap();
+        assert_eq!(owner(&st), (0, 0));
+        let (st, _) = pfs.getattr(ctx(), e.inode, None).unwrap();
+        assert_eq!(owner(&st), (0, 0));
+        let _ = fs::remove_dir_all(base);
     }
 }
