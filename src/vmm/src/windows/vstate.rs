@@ -177,6 +177,8 @@ impl Vm {
         let anonymous = guest_mem.iter().all(|r| r.file_offset().is_none());
         let mode = match std::env::var("SMOLVM_WHP_PREFILL") {
             _ if !anonymous => String::new(),
+            // Prefilling would commit the RAM lazy commit is there to save.
+            _ if super::lazy_mem::ram_enabled() => String::new(),
             Ok(m) => m,
             Err(_) => "advise-read".into(),
         };

@@ -738,9 +738,9 @@ fn release_region_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len:
         libc::madvise(host_addr as *mut libc::c_void, len as usize, advice)
     };
     #[cfg(target_os = "windows")]
-    unsafe {
-        DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len as usize)
-    };
+    if !windows_decommit(host_addr, len) {
+        unsafe { DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len as usize) };
+    }
     zeroed
 }
 
@@ -832,8 +832,9 @@ fn clear_hinted_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len: u
         };
         let _ = (mem, gpa);
         let addr = host_addr as *mut core::ffi::c_void;
-        let released = release_reported_pages()
-            && unsafe {
+        let released = windows_decommit(host_addr, len)
+            || release_reported_pages()
+                && unsafe {
                 VirtualFree(addr, len as usize, MEM_DECOMMIT) != 0
                     && !VirtualAlloc(addr, len as usize, MEM_COMMIT, PAGE_READWRITE).is_null()
             };
@@ -841,6 +842,26 @@ fn clear_hinted_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len: u
             unsafe { std::ptr::write_bytes(host_addr, 0, len as usize) };
         }
     }
+}
+
+/// With lazily committed guest RAM (`SMOLVM_WHP_LAZY_RAM=1`), decommit a
+/// freed range and leave it reserved: that returns its commit charge, and the
+/// guest's next touch commits it again as zeros through the VMM's lazy-commit
+/// path. False when RAM is committed up front, where a decommitted page would
+/// fault the guest, so the caller keeps its own policy.
+#[cfg(target_os = "windows")]
+fn windows_decommit(host_addr: *mut u8, len: u64) -> bool {
+    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let lazy = *LAZY.get_or_init(|| {
+        matches!(
+            std::env::var("SMOLVM_WHP_LAZY_RAM").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    });
+    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    // SAFETY: the range lies inside the reserved guest RAM mapping this VMM
+    // owns; the guest does not use it while it is reported free.
+    lazy && unsafe { VirtualFree(host_addr.cast(), len as usize, MEM_DECOMMIT) != 0 }
 }
 
 /// Whether free-page reports should give their pages back to the host now.

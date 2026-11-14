@@ -2404,7 +2404,7 @@ fn create_windows_guest_memory(
         .iter()
         .enumerate()
         .map(|(i, &(addr, size))| {
-            if i < ram_region_count {
+            if i < ram_region_count && !crate::windows::lazy_mem::ram_enabled() {
                 return vm_memory::GuestRegionMmap::from_range(addr, size, None)
                     .map_err(|e| format!("{e:?}"));
             }

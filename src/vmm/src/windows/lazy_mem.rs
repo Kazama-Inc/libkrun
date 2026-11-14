@@ -38,6 +38,21 @@ struct Range {
 }
 
 static RANGES: RwLock<Vec<Range>> = RwLock::new(Vec::new());
+
+/// Whether guest RAM, not only device windows, is reserved and committed on
+/// first touch (`SMOLVM_WHP_LAZY_RAM=1`). Then the VM's commit charge follows
+/// what the guest uses instead of its memory limit, at the price of a
+/// `MemoryAccess` exit per 64 KiB the guest touches first, and freed memory
+/// the balloon reports is decommitted, which returns the charge.
+pub fn ram_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("SMOLVM_WHP_LAZY_RAM").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
 static HANDLER: Once = Once::new();
 
 /// Register a reserved region so guest and host touches commit it on demand.
