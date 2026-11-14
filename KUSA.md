@@ -29,6 +29,6 @@ cargo build --release -p libkrun --features blk,net   # -> target/release/krun.d
 cargo test  --release -p krun-devices --features blk,net --lib   # 含 escape_tests，不需要 WHP
 ```
 
-上游自己的 Windows 构建是在 Linux 上用 mingw 交叉编（`x86_64-pc-windows-gnu`）。我们定用 MSVC 原生编（11-14 用户确认）。已知差异：MSVC 版偶发「流式命令 1 秒内没起来」（Go SDK 的 `TestE2EExecControl`），上游 GNU 版没复现，原因未查清。
+上游自己的 Windows 构建是在 Linux 上用 mingw 交叉编（`x86_64-pc-windows-gnu`）。我们定用 MSVC 原生编（11-14 用户确认）。原以为 MSVC 版偶发「流式命令 1 秒内没起来」，查明是 Go SDK e2e 的测试问题（心跳只精确到秒），与编法无关。
 
 `escape_tests` 的夹具建在 `%TEMP%` 下；GitHub runner 的 `%TEMP%` 是 8.3 短名（`RUNNER~1`），本地复现要把 `TMP`/`TEMP` 指到一个短名路径。
