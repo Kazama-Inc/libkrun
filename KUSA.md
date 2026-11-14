@@ -20,6 +20,7 @@
 |---|---|---|
 | `fix/windows-virtiofs-escapes` | Windows virtiofs 服务端：① NTFS junction（及所有名字代理类重解析点）按符号链接呈现，指向共享根内的换算成相对路径；② 所有 `NtCreateFile` 带 `OBJ_DONT_REPARSE`，路径上遇到重解析点即 ELOOP；③ 拒绝含 `/`、`\`、`:` 的 guest 文件名（原来 `mv a '..\outside\x'` 能写到共享目录外）；④ rename / link / symlink 先核对目录路径上没有重解析点；⑤ guest 建的、指向共享根外的符号链接存成 WSL 式，主机程序不跟。另含让 `krun-devices` 的单测能在 Windows 上编译的一条提交 | 暂不提上游。① 是安全问题，先按 `smol-machines/smolvm` 的 `SECURITY.md` 私下报告（报告待发） |
 | `fix/vsock-unix-prompt-close` | guest 关掉 unix 代理的连接时立即 `shutdown` 主机侧 socket，不等 reaper 的 5 秒宽限期。Windows 上宿主对自己的句柄 `shutdown` 叫不醒阻塞的 `recv`，取消一条命令原来要整 5 秒 | 暂不提上游 |
+| `fix/vsock-rx-backlog` | vsock 不再丢主机发往 guest 的控制包：rxq 原来满 256 个就拒收，而调用方不检查返回值，包就被悄悄丢掉；现在 rxq 按需增长，`push_packet` 先投递积压的包、保持顺序，「队列满」日志从 ERROR 降为 debug。Windows 上 `sys::peer_hung_up` 原来写死返回 `false`，主机放弃的连接会一直重试连接请求；现在用 `WSAPoll` 的 `POLLHUP` 判断 | 暂不提上游 |
 | `feat/windows-virtiofs-host-owner`（叠在 `fix/windows-virtiofs-escapes` 上） | `krun_add_virtiofs4` 新 flag `KRUN_VIRTIOFS_FLAG_HOST_OWNER`（`1 << 3`）：Windows 上没有记录属主的文件报 uid/gid 1000（`KRUN_VIRTIOFS_HOST_OWNER`）而不是 root，guest 才能把共享映射给非 root 工作负载。只给用户文件的共享用，镜像树不用；Linux、macOS 忽略 | 暂不提上游 |
 | `feat/whp-lazy-guest-ram` | Windows（WHP）的 guest RAM 先保留不提交，guest 第一次碰到时按 2 MiB 提交，并用 `WHvAdviseGpaRange` 预填这一块（原来开机就按上限整块提交，再整块预填）；balloon 报告的空闲页直接 decommit，归还提交额度；主机内核态 I/O 之前先提交要用的 virtio 缓冲区（`descriptor_utils`、vsock 包）。默认开，`SMOLVM_WHP_LAZY_RAM=0` 恢复原行为 | 暂不提上游 |
 
