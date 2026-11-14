@@ -6,11 +6,11 @@
 
 | 分支 | 内容 |
 |---|---|
-| `main` | 跟上游。libkrun 没有发布标签，`main` 钉在我们所用的 smolvm 发布版本的子模块指针上：smolvm v1.34.4 → `518949b4` |
-| `kusa` | `main` 加下表的补丁。smolvm fork 的 `kusa` 分支把 `libkrun` 子模块指到这里 |
-| `fix/*`、`feat/*` | 每个补丁一个分支，从 `main` 拉，能单独提给上游 |
+| `main` | GitHub fork 时带过来的上游提交（`3d539d3a`），**原样不动、不作基线**：组织规则集管所有仓库的 `main`，禁止强推、只能走 PR 合入，没法钉到别处。libkrun 没有发布标签，基线是我们所用 smolvm 发布版本的子模块指针：smolvm v1.34.4 → `518949b4` |
+| `kusa` | 基线 `518949b4` 加下表的补丁，**发布以它为准**（CI、smolvm fork 都认它）。smolvm fork 的 `kusa` 分支把 `libkrun` 子模块指到这里 |
+| `fix/*`、`feat/*` | 每个补丁一个分支，从基线提交拉（不是从 `main`），能单独提给上游 |
 
-升级：smolvm 合新发布标签时，把 `main` 快进到新标签的子模块指针，再把下表的分支变基上去、重做 `kusa`。
+升级：smolvm 换新发布标签时，取新标签的子模块指针作新基线，把下表的分支变基上去，再从新基线重做 `kusa`（`kusa` 不受规则集限制，可以重写）。
 
 ## 补丁
 
@@ -18,7 +18,7 @@
 
 | 分支 | 内容 | 上游状态 |
 |---|---|---|
-| `fix/windows-virtiofs-escapes` | Windows virtiofs 服务端：① NTFS junction（及所有名字代理类重解析点）按符号链接呈现，指向共享根内的换算成相对路径；② 所有 `NtCreateFile` 带 `OBJ_DONT_REPARSE`，路径上遇到重解析点即 ELOOP；③ 拒绝含 `/`、`\`、`:` 的 guest 文件名（原来 `mv a '..\outside\x'` 能写到共享目录外）；④ rename / link / symlink 先核对目录路径上没有重解析点；⑤ guest 建的、指向共享根外的符号链接存成 WSL 式，主机程序不跟。另含让 `krun-devices` 的单测能在 Windows 上编译的一条提交 | 草稿，未提 |
+| `fix/windows-virtiofs-escapes` | Windows virtiofs 服务端：① NTFS junction（及所有名字代理类重解析点）按符号链接呈现，指向共享根内的换算成相对路径；② 所有 `NtCreateFile` 带 `OBJ_DONT_REPARSE`，路径上遇到重解析点即 ELOOP；③ 拒绝含 `/`、`\`、`:` 的 guest 文件名（原来 `mv a '..\outside\x'` 能写到共享目录外）；④ rename / link / symlink 先核对目录路径上没有重解析点；⑤ guest 建的、指向共享根外的符号链接存成 WSL 式，主机程序不跟。另含让 `krun-devices` 的单测能在 Windows 上编译的一条提交 | 暂不提上游。① 是安全问题，先按 `smol-machines/smolvm` 的 `SECURITY.md` 私下报告（报告待发） |
 
 ## 构建（Windows，MSVC）
 
@@ -29,4 +29,6 @@ cargo build --release -p libkrun --features blk,net   # -> target/release/krun.d
 cargo test  --release -p krun-devices --features blk,net --lib   # 含 escape_tests，不需要 WHP
 ```
 
-上游自己的 Windows 构建是在 Linux 上用 mingw 交叉编（`x86_64-pc-windows-gnu`），我们用 MSVC 原生编；两者在 Windows e2e 上表现一致。
+上游自己的 Windows 构建是在 Linux 上用 mingw 交叉编（`x86_64-pc-windows-gnu`）。我们定用 MSVC 原生编（11-14 用户确认）。已知差异：MSVC 版偶发「流式命令 1 秒内没起来」（Go SDK 的 `TestE2EExecControl`），上游 GNU 版没复现，原因未查清。
+
+`escape_tests` 的夹具建在 `%TEMP%` 下；GitHub runner 的 `%TEMP%` 是 8.3 短名（`RUNNER~1`），本地复现要把 `TMP`/`TEMP` 指到一个短名路径。
