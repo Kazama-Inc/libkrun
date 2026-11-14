@@ -674,6 +674,17 @@ impl Proxy for UnixProxy {
             );
         }
 
+        // The guest has closed the connection (OP_RST), so nothing more will
+        // flow either way. Tell the host end now: the deferred removal below
+        // keeps the socket open for the reaper's grace period, and a host
+        // reader blocked in recv() would otherwise wait it out. On Windows the
+        // host cannot cut that wait short itself: shutting down its own handle
+        // does not wake a recv() blocked on the same AF_UNIX socket, so a
+        // cancelled exec took exactly the grace period (5 s) to return.
+        if let Err(e) = self.sock.shutdown(Shutdown::Both) {
+            debug!("release: shutdown host socket id={:#x}: {e}", self.id);
+        }
+
         ProxyUpdate {
             remove_proxy: ProxyRemoval::Deferred,
             ..Default::default()
