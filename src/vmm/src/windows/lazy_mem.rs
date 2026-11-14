@@ -30,11 +30,29 @@ const CHUNK: u64 = 64 * 1024;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
+/// Commit granularity for guest RAM (`register_ram`): a guest that touches a
+/// page of RAM usually goes on to touch its neighbours, and each exit then
+/// also asks the hypervisor to back the whole chunk at once
+/// (`WHvAdviseGpaRange` populate), which costs far less than the guest
+/// faulting in its 512 pages one by one.
+const RAM_CHUNK: u64 = 2 * 1024 * 1024;
+
 #[derive(Clone, Copy)]
 struct Range {
     gpa: u64,
     host: u64,
     size: u64,
+    chunk: u64,
+    populate: bool,
+}
+
+type Populate = Box<dyn Fn(u64, u64) + Send + Sync>;
+static POPULATE: std::sync::OnceLock<Populate> = std::sync::OnceLock::new();
+
+/// Set how a committed chunk of guest RAM is handed to the hypervisor in bulk
+/// (the partition's `WHvAdviseGpaRange` populate).
+pub fn set_populate(populate: Populate) {
+    let _ = POPULATE.set(populate);
 }
 
 static RANGES: RwLock<Vec<Range>> = RwLock::new(Vec::new());
@@ -57,6 +75,16 @@ static HANDLER: Once = Once::new();
 
 /// Register a reserved region so guest and host touches commit it on demand.
 pub fn register(gpa: u64, host: *mut u8, size: usize) {
+    register_with(gpa, host, size, CHUNK, false);
+}
+
+/// [`register`] for guest RAM: committed in `RAM_CHUNK`s, each populated in
+/// the hypervisor as it is committed.
+pub fn register_ram(gpa: u64, host: *mut u8, size: usize) {
+    register_with(gpa, host, size, RAM_CHUNK, true);
+}
+
+fn register_with(gpa: u64, host: *mut u8, size: usize, chunk: u64, populate: bool) {
     HANDLER.call_once(|| {
         // SAFETY: the handler only reads the exception record and commits pages
         // inside registered, still-reserved ranges.
@@ -66,13 +94,20 @@ pub fn register(gpa: u64, host: *mut u8, size: usize) {
         gpa,
         host: host as u64,
         size: size as u64,
+        chunk,
+        populate,
     });
 }
 
 /// Commit the chunk holding `start + offset` of `range`, clamped to the range.
 fn commit(range: &Range, offset: u64) -> bool {
-    let chunk_start = offset & !(CHUNK - 1);
-    let len = CHUNK.min(range.size - chunk_start);
+    commit_chunk(range, offset).is_some()
+}
+
+/// Commit the chunk holding `offset`; returns its (offset, length).
+fn commit_chunk(range: &Range, offset: u64) -> Option<(u64, u64)> {
+    let chunk_start = offset & !(range.chunk - 1);
+    let len = range.chunk.min(range.size - chunk_start);
     // SAFETY: the address lies inside a reservation this process owns, and
     // committing an already-committed page is a no-op that keeps its contents.
     let addr = unsafe {
@@ -83,7 +118,7 @@ fn commit(range: &Range, offset: u64) -> bool {
             PAGE_READWRITE,
         )
     };
-    !addr.is_null()
+    (!addr.is_null()).then_some((chunk_start, len))
 }
 
 /// Called on a `MemoryAccess` exit for a mapped GPA: if the GPA lies in a
@@ -91,10 +126,18 @@ fn commit(range: &Range, offset: u64) -> bool {
 /// retries the instruction. False means the access is not ours (MMIO).
 pub fn commit_gpa(gpa: u64) -> bool {
     let ranges = RANGES.read().unwrap();
-    match ranges.iter().find(|r| gpa >= r.gpa && gpa - r.gpa < r.size) {
-        Some(range) => commit(range, gpa - range.gpa),
-        None => false,
+    let Some(range) = ranges.iter().find(|r| gpa >= r.gpa && gpa - r.gpa < r.size) else {
+        return false;
+    };
+    let Some((start, len)) = commit_chunk(range, gpa - range.gpa) else {
+        return false;
+    };
+    if range.populate
+        && let Some(populate) = POPULATE.get()
+    {
+        populate(range.gpa + start, len);
     }
+    true
 }
 
 unsafe extern "system" fn on_access_violation(info: *mut EXCEPTION_POINTERS) -> i32 {

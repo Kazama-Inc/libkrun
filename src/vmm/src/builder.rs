@@ -2409,8 +2409,12 @@ fn create_windows_guest_memory(
                     .map_err(|e| format!("{e:?}"));
             }
             let mapping = vm_memory::MmapRegion::new_reserved(size)
-                .map_err(|e| format!("reserve device window at {addr:?}: {e}"))?;
-            crate::windows::lazy_mem::register(addr.0, mapping.as_ptr(), size);
+                .map_err(|e| format!("reserve guest memory at {addr:?}: {e}"))?;
+            if i < ram_region_count {
+                crate::windows::lazy_mem::register_ram(addr.0, mapping.as_ptr(), size);
+            } else {
+                crate::windows::lazy_mem::register(addr.0, mapping.as_ptr(), size);
+            }
             vm_memory::GuestRegionMmap::new(mapping, addr)
                 .ok_or_else(|| "device window region overflows".to_string())
         })
