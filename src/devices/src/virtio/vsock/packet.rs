@@ -195,7 +195,10 @@ fn get_host_address<T: GuestMemory>(
     guest_addr: GuestAddress,
     size: usize,
 ) -> result::Result<*mut u8, GuestMemoryError> {
-    Ok(mem.get_slice(guest_addr, size)?.ptr_guard_mut().as_ptr())
+    let ptr = mem.get_slice(guest_addr, size)?.ptr_guard_mut().as_ptr();
+    // The proxies recv() and send() straight from these buffers.
+    super::super::guest_commit::ensure(ptr, size);
+    Ok(ptr)
 }
 
 impl VsockPacket {

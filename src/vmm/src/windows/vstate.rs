@@ -177,6 +177,19 @@ impl Vm {
         let anonymous = guest_mem.iter().all(|r| r.file_offset().is_none());
         let mode = match std::env::var("SMOLVM_WHP_PREFILL") {
             _ if !anonymous => String::new(),
+            // Prefilling would commit the RAM lazy commit is there to save;
+            // lazy commit populates each chunk as it commits it instead.
+            _ if super::lazy_mem::ram_enabled() => {
+                let vm = self.whp_vm.clone();
+                super::lazy_mem::set_populate(Box::new(move |gpa, len| {
+                    let _ = vm.populate(gpa, len, true);
+                }));
+                devices::virtio::guest_commit::install(
+                    super::lazy_mem::ensure_committed,
+                    super::lazy_mem::decommitted,
+                );
+                String::new()
+            }
             Ok(m) => m,
             Err(_) => "advise-read".into(),
         };
