@@ -5,16 +5,10 @@
 /// `MuxerRxQ` implements a helper object that `VsockMuxer` can use for queuing RX (host -> guest)
 /// packets (or rather instructions on how to build said packets).
 ///
-/// Under ideal operation, every connection, that has pending RX data, will be present in the muxer
-/// RX queue. However, since the RX queue is smaller than the connection pool, it may, under some
-/// conditions, become full, meaning that it can no longer account for all the connections that can
-/// yield RX data.  When that happens, we say that it is no longer "synchronized" (i.e. with the
-/// connection pool).  A desynchronized RX queue still holds valid data, and the muxer will
-/// continue to pop packets from it. However, when a desynchronized queue is drained, additional
-/// data may still be available, so the muxer will have to perform a more costly walk of the entire
-/// connection pool to find it.  This walk is performed here, as part of building an RX queue from
-/// the connection pool. When an out-of-sync is drained, the muxer will discard it, and attempt to
-/// rebuild a synced one.
+/// It holds the control packets (connect requests and responses, resets,
+/// shutdowns, credit updates) that found no free RX buffer in the guest's
+/// queue, in order, until the guest posts more. These packets exist nowhere
+/// else, so the queue never drops one: it grows instead (see [`MuxerRxQ::push`]).
 use std::collections::VecDeque;
 
 use super::defs;
@@ -26,8 +20,6 @@ use super::packet::{TsiAcceptRsp, TsiConnectRsp, TsiListenRsp, VsockPacket};
 pub struct MuxerRxQ {
     /// The RX queue data.
     q: VecDeque<MuxerRx>,
-    /// The RX queue sync status.
-    synced: bool,
 }
 
 impl MuxerRxQ {
@@ -37,31 +29,25 @@ impl MuxerRxQ {
     pub fn new() -> Self {
         Self {
             q: VecDeque::with_capacity(Self::SIZE),
-            synced: true,
         }
     }
 
-    /// Push a new RX item to the queue.
+    /// Push a new RX item to the queue. Always succeeds.
     ///
-    /// A push will fail when:
-    /// - trying to push a connection key onto an out-of-sync, or full queue; or
-    /// - trying to push an RST onto a queue already full of RSTs.
-    ///
-    /// RSTs take precedence over connections, because connections can always be queried for
-    /// pending RX data later. Aside from this queue, there is no other storage for RSTs, so
-    /// failing to push one means that we have to drop the packet.
-    ///
-    /// Returns:
-    /// - `true` if the new item has been successfully queued; or
-    /// - `false` if there was no room left in the queue.
+    /// Every item is a control packet (a connect request or response, a
+    /// reset, a shutdown, a credit update) that exists nowhere else, so
+    /// dropping one leaves its connection waiting forever: a lost response or
+    /// credit update hangs whoever is blocked on that connection. The queue
+    /// used to refuse items past `SIZE` and its callers ignored the refusal,
+    /// so a burst that outran the guest's RX buffers lost packets and,
+    /// occasionally, a live connection. It grows instead; `SIZE` is only the
+    /// level past which a backlog is worth reporting.
     pub fn push(&mut self, rx: MuxerRx) -> bool {
-        // Pushing to a non-full, synchronized queue will always succeed.
-        if self.is_synced() && !self.is_full() {
-            self.q.push_back(rx);
-            return true;
+        self.q.push_back(rx);
+        if self.q.len() % Self::SIZE == 0 {
+            warn!("vsock RX backlog at {} packets", self.q.len());
         }
-
-        false
+        true
     }
 
     /// Pop an RX item from the front of the queue.
@@ -69,17 +55,11 @@ impl MuxerRxQ {
         self.q.pop_front()
     }
 
-    /// Drop all pending RX items and mark the queue synced. Used on VM restore
+    /// Drop all pending RX items. Used on VM restore
     /// to discard packets queued for connections that no longer exist after the
     /// rewind (see [`super::muxer::VsockMuxer::reset_connections`]).
     pub fn clear(&mut self) {
         self.q.clear();
-        self.synced = true;
-    }
-
-    /// Check if the RX queue is synchronized with the connection pool.
-    pub fn is_synced(&self) -> bool {
-        self.synced
     }
 
     /// Get the total number of items in the queue.
@@ -90,11 +70,6 @@ impl MuxerRxQ {
     /// Check if the queue is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Check if the queue is full.
-    pub fn is_full(&self) -> bool {
-        self.len() == Self::SIZE
     }
 }
 

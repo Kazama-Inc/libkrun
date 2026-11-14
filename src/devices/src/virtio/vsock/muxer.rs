@@ -106,18 +106,42 @@ pub fn push_packet(
     snapshot_gate: &SnapshotGate,
 ) {
     let _snapshot_activity = snapshot_gate.enter();
+    // Same lock order as the RX queue handler: the virtqueue, then the backlog.
     let mut queue = queue_mutex.lock().unwrap();
-    if let Some(head) = queue.pop(mem) {
-        if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-            rx_to_pkt(cid, rx, &mut pkt);
-            if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
-                error!("failed to add used elements to the queue: {e:?}");
-            }
+    let mut rxq = rxq_mutex.lock().unwrap();
+    // Packets already waiting go first, so a connection never sees its
+    // packets out of order (a credit update ahead of the response it follows).
+    while !rxq.is_empty() {
+        let Some(head) = queue.pop(mem) else {
+            break;
+        };
+        let rx = rxq.pop().expect("backlog is not empty");
+        deliver(cid, rx, &mut queue, mem, &head);
+    }
+    if rxq.is_empty()
+        && let Some(head) = queue.pop(mem)
+    {
+        deliver(cid, rx, &mut queue, mem, &head);
+        return;
+    }
+    // No RX buffer from the guest: keep the packet until it posts more. This
+    // is ordinary backpressure, not an error.
+    debug!("vsock RX queue full, holding packet in rxq");
+    rxq.push(rx);
+}
+
+fn deliver(
+    cid: u64,
+    rx: MuxerRx,
+    queue: &mut VirtQueue,
+    mem: &GuestMemoryMmap,
+    head: &super::super::DescriptorChain,
+) {
+    if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(head) {
+        rx_to_pkt(cid, rx, &mut pkt);
+        if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
+            error!("failed to add used elements to the queue: {e:?}");
         }
-    } else {
-        error!("couldn't push pkt to queue, adding it to rxq");
-        drop(queue);
-        rxq_mutex.lock().unwrap().push(rx);
     }
 }
 
@@ -460,21 +484,14 @@ impl VsockMuxer {
             }
         };
 
-        let _snapshot_activity = self.snapshot_gate.enter();
-        let mut queue = queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(mem) {
-            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                {
-                    error!("failed to add used elements to the queue: {e:?}");
-                }
-            }
-        } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
-            drop(queue);
-            self.rxq.lock().unwrap().push(rx);
-        }
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            queue_mutex,
+            mem,
+            &self.snapshot_gate,
+        );
     }
 
     /// Reset all live host-backed connections for a VM restore/rewind.
