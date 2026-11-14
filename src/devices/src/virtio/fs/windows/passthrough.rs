@@ -576,11 +576,40 @@ fn create_lx_symlink(link_path: &Path, target: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// An absolute link target with 8.3 short names expanded, so it compares
+/// with the shared root, which is canonical. A junction keeps whatever
+/// spelling its creator used: `mklink /J` under a short `%TEMP%`
+/// (`C:\Users\RUNNER~1\...`) stores the short form. Unchanged if relative or
+/// if it does not exist. Only the string the guest is shown depends on it;
+/// following the link still goes through this server's checks.
+fn long_path(target: PathBuf) -> PathBuf {
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+    if !target.is_absolute() {
+        return target;
+    }
+    let wide = path_to_wide(&target);
+    let mut buf = vec![0u16; 512];
+    loop {
+        let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        if n == 0 {
+            return target;
+        }
+        if n < buf.len() {
+            return PathBuf::from(OsString::from_wide(&buf[..n]));
+        }
+        buf.resize(n, 0);
+    }
+}
+
 /// A link's target as the guest sees it: for a symlink or junction, as
 /// [`guest_link_target`] presents it; for a WSL-style link, its raw bytes.
 fn read_symlink_target(path: &Path, root: &Path) -> io::Result<Vec<u8>> {
     match fs::read_link(path) {
-        Ok(target) => Ok(guest_link_target(path, &target, root).into_bytes()),
+        Ok(target) => {
+            let target = long_path(target);
+            Ok(guest_link_target(path, &target, root).into_bytes())
+        }
         // A WSL-style link, which std does not parse.
         Err(native) => read_lx_symlink(path).map_err(|_| native),
     }
