@@ -184,6 +184,10 @@ impl Vm {
                 super::lazy_mem::set_populate(Box::new(move |gpa, len| {
                     let _ = vm.populate(gpa, len, true);
                 }));
+                devices::virtio::guest_commit::install(
+                    super::lazy_mem::ensure_committed,
+                    super::lazy_mem::decommitted,
+                );
                 String::new()
             }
             Ok(m) => m,

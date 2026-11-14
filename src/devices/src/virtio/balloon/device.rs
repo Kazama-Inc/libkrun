@@ -844,7 +844,7 @@ fn clear_hinted_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len: u
     }
 }
 
-/// With lazily committed guest RAM (`SMOLVM_WHP_LAZY_RAM=1`), decommit a
+/// With lazily committed guest RAM (the default; see the VMM's `lazy_mem`), decommit a
 /// freed range and leave it reserved: that returns its commit charge, and the
 /// guest's next touch commits it again as zeros through the VMM's lazy-commit
 /// path. False when RAM is committed up front, where a decommitted page would
@@ -853,15 +853,22 @@ fn clear_hinted_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len: u
 fn windows_decommit(host_addr: *mut u8, len: u64) -> bool {
     static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let lazy = *LAZY.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("SMOLVM_WHP_LAZY_RAM").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
+            Ok("0") | Ok("off") | Ok("false")
         )
     });
     use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    if !lazy {
+        return false;
+    }
     // SAFETY: the range lies inside the reserved guest RAM mapping this VMM
     // owns; the guest does not use it while it is reported free.
-    lazy && unsafe { VirtualFree(host_addr.cast(), len as usize, MEM_DECOMMIT) != 0 }
+    let freed = unsafe { VirtualFree(host_addr.cast(), len as usize, MEM_DECOMMIT) != 0 };
+    if freed {
+        crate::virtio::guest_commit::decommitted(host_addr, len as usize);
+    }
+    freed
 }
 
 /// Whether free-page reports should give their pages back to the host now.

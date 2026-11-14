@@ -207,10 +207,13 @@ impl<'a> Reader<'a> {
                     .addr
                     .checked_sub(region.start_addr().raw_value())
                     .unwrap();
-                region
+                let slice = region
                     .deref()
                     .get_slice(offset.raw_value() as usize, desc.len as usize)
-                    .map_err(Error::VolatileMemoryError)
+                    .map_err(Error::VolatileMemoryError)?;
+                // File and socket reads and writes go straight to these buffers.
+                super::guest_commit::ensure(slice.ptr_guard().as_ptr(), slice.len());
+                Ok(slice)
             })
             .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
         Ok(Reader {
@@ -359,10 +362,13 @@ impl<'a> Writer<'a> {
                     .addr
                     .checked_sub(region.start_addr().raw_value())
                     .unwrap();
-                region
+                let slice = region
                     .deref()
                     .get_slice(offset.raw_value() as usize, desc.len as usize)
-                    .map_err(Error::VolatileMemoryError)
+                    .map_err(Error::VolatileMemoryError)?;
+                // File and socket reads and writes go straight to these buffers.
+                super::guest_commit::ensure(slice.ptr_guard().as_ptr(), slice.len());
+                Ok(slice)
             })
             .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
 

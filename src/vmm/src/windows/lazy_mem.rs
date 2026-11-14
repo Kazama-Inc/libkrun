@@ -14,6 +14,7 @@
 //! faults in user mode and is committed by a vectored exception handler.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Once, RwLock};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
@@ -44,6 +45,26 @@ struct Range {
     size: u64,
     chunk: u64,
     populate: bool,
+    /// One bit per chunk known to be committed, so [`ensure_committed`] can
+    /// skip the system call. A clear bit only means "maybe not committed".
+    committed: &'static [AtomicU64],
+}
+
+impl Range {
+    fn mark(&self, chunk_start: u64, committed: bool) {
+        let i = (chunk_start / self.chunk) as usize;
+        let bit = 1u64 << (i % 64);
+        if committed {
+            self.committed[i / 64].fetch_or(bit, Ordering::Relaxed);
+        } else {
+            self.committed[i / 64].fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+
+    fn is_marked(&self, chunk_start: u64) -> bool {
+        let i = (chunk_start / self.chunk) as usize;
+        self.committed[i / 64].load(Ordering::Relaxed) & (1u64 << (i % 64)) != 0
+    }
 }
 
 type Populate = Box<dyn Fn(u64, u64) + Send + Sync>;
@@ -58,16 +79,17 @@ pub fn set_populate(populate: Populate) {
 static RANGES: RwLock<Vec<Range>> = RwLock::new(Vec::new());
 
 /// Whether guest RAM, not only device windows, is reserved and committed on
-/// first touch (`SMOLVM_WHP_LAZY_RAM=1`). Then the VM's commit charge follows
+/// first touch (the default; `SMOLVM_WHP_LAZY_RAM=0` commits it all up front
+/// and prefills it, as before). Then the VM's commit charge follows
 /// what the guest uses instead of its memory limit, at the price of a
-/// `MemoryAccess` exit per 64 KiB the guest touches first, and freed memory
+/// `MemoryAccess` exit per 2 MiB the guest touches first, and freed memory
 /// the balloon reports is decommitted, which returns the charge.
 pub fn ram_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("SMOLVM_WHP_LAZY_RAM").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
+            Ok("0") | Ok("off") | Ok("false")
         )
     })
 }
@@ -90,12 +112,21 @@ fn register_with(gpa: u64, host: *mut u8, size: usize, chunk: u64, populate: boo
         // inside registered, still-reserved ranges.
         unsafe { AddVectoredExceptionHandler(1, Some(on_access_violation)) };
     });
+    let chunks = (size as u64).div_ceil(chunk) as usize;
+    // Ranges live as long as the process.
+    let committed: &'static [AtomicU64] = Box::leak(
+        (0..chunks.div_ceil(64))
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
     RANGES.write().unwrap().push(Range {
         gpa,
         host: host as u64,
         size: size as u64,
         chunk,
         populate,
+        committed,
     });
 }
 
@@ -118,7 +149,59 @@ fn commit_chunk(range: &Range, offset: u64) -> Option<(u64, u64)> {
             PAGE_READWRITE,
         )
     };
-    (!addr.is_null()).then_some((chunk_start, len))
+    if addr.is_null() {
+        return None;
+    }
+    range.mark(chunk_start, true);
+    Some((chunk_start, len))
+}
+
+/// Commit every chunk of registered memory in `[ptr, ptr + len)` that may not
+/// be committed yet. For buffers a host system call is about to use, which a
+/// kernel-mode access cannot commit on its own (`devices::virtio::guest_commit`).
+pub fn ensure_committed(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (start, end) = (ptr as u64, ptr as u64 + len as u64);
+    let Ok(ranges) = RANGES.read() else {
+        return;
+    };
+    for range in ranges
+        .iter()
+        .filter(|r| start < r.host + r.size && end > r.host)
+    {
+        let from = start.max(range.host) - range.host;
+        let to = end.min(range.host + range.size) - range.host;
+        let mut chunk = from & !(range.chunk - 1);
+        while chunk < to {
+            if !range.is_marked(chunk) {
+                let _ = commit_chunk(range, chunk);
+            }
+            chunk += range.chunk;
+        }
+    }
+}
+
+/// Forget that the chunks overlapping `[ptr, ptr + len)` are committed: the
+/// balloon decommitted (part of) them.
+pub fn decommitted(ptr: *const u8, len: usize) {
+    let (start, end) = (ptr as u64, ptr as u64 + len as u64);
+    let Ok(ranges) = RANGES.read() else {
+        return;
+    };
+    for range in ranges
+        .iter()
+        .filter(|r| start < r.host + r.size && end > r.host)
+    {
+        let from = start.max(range.host) - range.host;
+        let to = end.min(range.host + range.size) - range.host;
+        let mut chunk = from & !(range.chunk - 1);
+        while chunk < to {
+            range.mark(chunk, false);
+            chunk += range.chunk;
+        }
+    }
 }
 
 /// Called on a `MemoryAccess` exit for a mapped GPA: if the GPA lies in a
