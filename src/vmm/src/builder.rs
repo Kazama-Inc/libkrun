@@ -902,9 +902,9 @@ pub fn build_microvm(
     #[allow(unused_mut)]
     let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
     if let Some(cmdline) = payload_config.kernel_cmdline {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_str(cmdline.as_str())?;
     } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
-        kernel_cmdline.insert_str(cmdline).unwrap();
+        kernel_cmdline.insert_str(cmdline)?;
     } else {
         kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).unwrap();
     }
@@ -917,7 +917,7 @@ pub fn build_microvm(
     kernel_cmdline.insert_str("arm64.nopauth").unwrap();
 
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_str(cmdline.as_str())?;
     }
 
     if let Some(kernel_console) = &vm_resources.kernel_console {
@@ -932,7 +932,7 @@ pub fn build_microvm(
             format!("console={kernel_console}").as_str(),
         );
         kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-        kernel_cmdline.insert_str(cmdline).unwrap();
+        kernel_cmdline.insert_str(cmdline)?;
     }
 
     #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
@@ -1702,7 +1702,7 @@ pub fn build_microvm(
             .insert_str(format!("maxcpus={}", vcpu_config.vcpu_count))?;
     }
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
-        vmm.kernel_cmdline.insert_str(s).unwrap();
+        vmm.kernel_cmdline.insert_str(s)?;
     };
     vmm_timing!("devices attached");
 
