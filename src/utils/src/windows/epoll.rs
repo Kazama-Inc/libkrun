@@ -41,8 +41,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT as WAIT_TIMEOUT_CODE,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    FD_ACCEPT, FD_CLOSE, FD_CONNECT, FD_READ, FD_WRITE, SOCKET, WSACloseEvent, WSACreateEvent,
-    WSAEVENT, WSAEnumNetworkEvents, WSAEventSelect, WSANETWORKEVENTS,
+    FD_ACCEPT, FD_CLOSE, FD_CONNECT, FD_READ, FD_WRITE, POLLERR, POLLHUP, POLLRDNORM, POLLWRNORM,
+    SOCKET, WSACloseEvent, WSACreateEvent, WSAEVENT, WSAEnumNetworkEvents, WSAEventSelect,
+    WSANETWORKEVENTS, WSAPOLLFD, WSAPoll, WSASetEvent,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::IO::{
@@ -86,6 +87,54 @@ fn wsa_events_to_set(network_events: i32) -> EventSet {
         set |= EventSet::IN | EventSet::HANG_UP;
     }
     set
+}
+
+/// What `socket` is ready for right now, among `interest`. A hang-up or an
+/// error is reported as `IN | HANG_UP`, as `wsa_events_to_set` reports FD_CLOSE.
+///
+/// `WSAEventSelect` is edge-triggered: once `WSAEnumNetworkEvents` has
+/// reported FD_READ, Winsock records it again only after a `recv`, and a new
+/// `WSAEventSelect` on a socket whose data was already reported does not signal
+/// either. The interest sets callers register are level-triggered (as epoll's
+/// are on Linux), so the polling state of the socket itself decides what is
+/// ready; see [`Epoll::wait`].
+fn socket_readiness(socket: HANDLE, interest: EventSet) -> EventSet {
+    let mut events = 0;
+    if interest.contains(EventSet::IN) {
+        events |= POLLRDNORM;
+    }
+    if interest.contains(EventSet::OUT) {
+        events |= POLLWRNORM;
+    }
+    let mut fd = WSAPOLLFD {
+        fd: socket as SOCKET,
+        events,
+        revents: 0,
+    };
+    // SAFETY: one valid WSAPOLLFD; a zero timeout never blocks.
+    if unsafe { WSAPoll(&mut fd, 1, 0) } <= 0 {
+        return EventSet::empty();
+    }
+    let mut ready = EventSet::empty();
+    if fd.revents & POLLRDNORM != 0 {
+        ready |= EventSet::IN;
+    }
+    if fd.revents & POLLWRNORM != 0 {
+        ready |= EventSet::OUT;
+    }
+    if fd.revents & (POLLHUP | POLLERR) != 0 {
+        ready |= EventSet::IN | EventSet::HANG_UP;
+    }
+    ready
+}
+
+/// Whether a socket watch with `events` is level-triggered and ready now,
+/// so its event must be signaled for `wait` to report it.
+fn level_ready(socket: HANDLE, events: u32) -> bool {
+    let interest = EventSet::from_bits_truncate(events);
+    !socket.is_null()
+        && !interest.contains(EventSet::EDGE_TRIGGERED)
+        && !socket_readiness(socket, interest).is_empty()
 }
 
 // Generic access mask requesting all permissions the caller is allowed.
@@ -280,6 +329,10 @@ fn associate_wcp(
 pub struct Epoll {
     iocp: Arc<CompletionPort>,
     entries: Vec<OVERLAPPED_ENTRY>,
+    /// Level-triggered sockets the last `wait` reported. The next `wait`
+    /// signals those still ready, once the caller has had its chance to drain
+    /// them (see [`socket_readiness`]).
+    reported_sockets: Vec<RawFd>,
 }
 
 impl Clone for Epoll {
@@ -287,6 +340,7 @@ impl Clone for Epoll {
         Epoll {
             iocp: self.iocp.clone(),
             entries: Vec::new(),
+            reported_sockets: Vec::new(),
         }
     }
 }
@@ -312,6 +366,7 @@ impl Epoll {
                 zombies: Mutex::new(Vec::new()),
             }),
             entries: Vec::with_capacity(32),
+            reported_sockets: Vec::new(),
         })
     }
 
@@ -394,6 +449,12 @@ impl Epoll {
                     return Err(e);
                 }
 
+                // Data that arrived before this registration (or was reported
+                // to an earlier one and not read) signals nothing by itself.
+                if level_ready(socket, event.events()) {
+                    // SAFETY: `wsa_event` is the live event created above.
+                    unsafe { WSASetEvent(wsa_event as WSAEVENT) };
+                }
                 watches.insert(fd, watch_ptr);
             }
             ControlOperation::Modify => {
@@ -426,6 +487,11 @@ impl Epoll {
                     watch.target,
                     watch_ptr as *mut _,
                 )?;
+                if level_ready(watch.socket, event.events()) {
+                    // SAFETY: the watch's event lives until the watch is deleted,
+                    // and we hold the table lock.
+                    unsafe { WSASetEvent(watch.wsa_event as WSAEVENT) };
+                }
             }
             ControlOperation::Delete => {
                 let watch_ptr = watches.remove(&fd).ok_or_else(|| {
@@ -479,6 +545,24 @@ impl Epoll {
         events: &mut [EpollEvent],
     ) -> io::Result<usize> {
         let iocp_handle = self.iocp.handle;
+
+        // Level-triggered sockets reported last time that the caller left
+        // ready (data it did not read, a hang-up it has not acted on yet) are
+        // reported again, as epoll does on Linux. Their FD_* event will not
+        // fire again by itself; signal it.
+        if !self.reported_sockets.is_empty() {
+            let watches = self.iocp.watches.lock().unwrap();
+            for fd in self.reported_sockets.drain(..) {
+                if let Some(&watch_ptr) = watches.get(&fd) {
+                    // SAFETY: a watch in the table is live while we hold its lock.
+                    let watch = unsafe { &*watch_ptr };
+                    if level_ready(watch.socket, watch.events.load(Ordering::Acquire)) {
+                        // SAFETY: as above, the event lives as long as the watch.
+                        unsafe { WSASetEvent(watch.wsa_event as WSAEVENT) };
+                    }
+                }
+            }
+        }
 
         let capacity = events.len().min(max_events).min(i32::MAX as usize);
         if capacity == 0 {
@@ -561,6 +645,13 @@ impl Epoll {
                         && nev.iErrorCode[FD_CONNECT_BIT] != 0
                     {
                         set = (set - EventSet::OUT) | EventSet::HANG_UP;
+                    }
+                    // A level-triggered watch reports what the socket is ready
+                    // for now, including readiness an earlier event already
+                    // reported (see `socket_readiness`).
+                    if !event_set.contains(EventSet::EDGE_TRIGGERED) {
+                        set |= socket_readiness(watch.socket, event_set);
+                        self.reported_sockets.push(watch.fd);
                     }
                     set
                 }
@@ -883,5 +974,138 @@ mod tests {
             .ctl(ControlOperation::Delete, ev, &EpollEvent::default())
             .unwrap();
         close(ev);
+    }
+
+    /// Wait for an IN event with `data` on `epoll`, up to `ms`.
+    fn wait_readable(epoll: &mut Epoll, data: u64, ms: u64) -> bool {
+        let mut ready = vec![EpollEvent::default(); 8];
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            let n = epoll.wait(8, 50, &mut ready).unwrap();
+            if ready[..n]
+                .iter()
+                .any(|e| e.data() == data && e.event_set().contains(EventSet::IN))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Connected sockets are level-triggered, as on Linux: data left unread
+    /// is reported again. Winsock records FD_READ only once until the next
+    /// recv, so without help a consumer that skips the read (the vsock proxy
+    /// does when the guest has no RX buffer free) never hears of that socket
+    /// again, and the request in it is never delivered.
+    #[test]
+    fn test_unread_socket_data_is_reported_again() {
+        use std::io::{Read, Write};
+        use std::os::windows::io::AsRawSocket;
+
+        let mut epoll = Epoll::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let sock = server.as_raw_socket() as RawFd;
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                sock,
+                &EpollEvent::new(EventSet::IN, 7),
+            )
+            .unwrap();
+
+        client.write_all(b"request").unwrap();
+        assert!(wait_readable(&mut epoll, 7, 1000), "first readiness");
+        // Not read: still readable, so it must be reported again ...
+        assert!(
+            wait_readable(&mut epoll, 7, 1000),
+            "unread data reported again"
+        );
+        // ... and after a re-registration (the muxer's Delete + Add).
+        epoll
+            .ctl(ControlOperation::Delete, sock, &EpollEvent::default())
+            .unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                sock,
+                &EpollEvent::new(EventSet::IN, 8),
+            )
+            .unwrap();
+        assert!(
+            wait_readable(&mut epoll, 8, 1000),
+            "unread data after re-registration"
+        );
+
+        // Once drained it goes quiet, and new data is reported once more.
+        let mut buf = [0u8; 64];
+        while server.read(&mut buf).is_ok_and(|n| n > 0) {}
+        assert!(
+            !wait_readable(&mut epoll, 8, 300),
+            "drained socket stays quiet"
+        );
+        client.write_all(b"more").unwrap();
+        assert!(wait_readable(&mut epoll, 8, 1000), "new data after a drain");
+
+        epoll
+            .ctl(ControlOperation::Delete, sock, &EpollEvent::default())
+            .unwrap();
+    }
+
+    /// A socket from `accept()` inherits the listener's `WSAEventSelect`, so
+    /// data the peer sends before the socket is registered is recorded against
+    /// the listener's event. Winsock records FD_READ again only after a recv,
+    /// so unless `Add` notices the data already there, the socket never
+    /// reports readable: the vsock muxer registers a host connection only once
+    /// the guest accepts it, and a request written before that was never read.
+    #[test]
+    fn test_socket_with_data_before_add_reports_readable() {
+        use std::io::Write;
+        use std::os::windows::io::AsRawSocket;
+
+        let mut epoll = Epoll::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let lsock = listener.as_raw_socket() as RawFd;
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                lsock,
+                &EpollEvent::new(EventSet::IN, 1),
+            )
+            .unwrap();
+
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client.write_all(b"request").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let sock = server.as_raw_socket() as RawFd;
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                sock,
+                &EpollEvent::new(EventSet::IN, 2),
+            )
+            .unwrap();
+
+        let mut ready = vec![EpollEvent::default(); 8];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut readable = false;
+        while !readable && Instant::now() < deadline {
+            let n = epoll.wait(8, 100, &mut ready).unwrap();
+            readable = ready[..n]
+                .iter()
+                .any(|e| e.data() == 2 && e.event_set().contains(EventSet::IN));
+        }
+
+        epoll
+            .ctl(ControlOperation::Delete, sock, &EpollEvent::default())
+            .unwrap();
+        epoll
+            .ctl(ControlOperation::Delete, lsock, &EpollEvent::default())
+            .unwrap();
+        assert!(readable, "data sent before Add was never reported");
     }
 }
