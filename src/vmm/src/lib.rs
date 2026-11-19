@@ -57,6 +57,10 @@ mod macos;
 mod terminal;
 #[cfg(target_os = "windows")]
 mod windows;
+/// Lazily committed guest memory, public for its integration test.
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub use windows::lazy_mem;
 pub mod worker;
 
 #[cfg(target_os = "macos")]

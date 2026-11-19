@@ -12,14 +12,15 @@
 use std::sync::OnceLock;
 
 type Hook = fn(*const u8, usize);
+type DecommitHook = fn(*const u8, usize) -> bool;
 
 static ENSURE: OnceLock<Hook> = OnceLock::new();
-static DECOMMITTED: OnceLock<Hook> = OnceLock::new();
+static DECOMMIT: OnceLock<DecommitHook> = OnceLock::new();
 
 /// Install the VMM's implementations.
-pub fn install(ensure: Hook, decommitted: Hook) {
+pub fn install(ensure: Hook, decommit: DecommitHook) {
     let _ = ENSURE.set(ensure);
-    let _ = DECOMMITTED.set(decommitted);
+    let _ = DECOMMIT.set(decommit);
 }
 
 /// Commit `[ptr, ptr + len)` if it lies in lazily committed guest RAM.
@@ -30,10 +31,11 @@ pub fn ensure(ptr: *const u8, len: usize) {
     }
 }
 
-/// Note that `[ptr, ptr + len)` of guest RAM was decommitted.
+/// Decommit `[ptr, ptr + len)` of lazily committed guest RAM, which the guest
+/// reported free. The VMM does it so the change and its record of what is
+/// committed cannot race with a commit. False without lazy RAM, where a
+/// decommitted page would fault the guest, or if the decommit failed.
 #[inline]
-pub fn decommitted(ptr: *const u8, len: usize) {
-    if let Some(decommitted) = DECOMMITTED.get() {
-        decommitted(ptr, len);
-    }
+pub fn decommit(ptr: *const u8, len: usize) -> bool {
+    DECOMMIT.get().is_some_and(|decommit| decommit(ptr, len))
 }
