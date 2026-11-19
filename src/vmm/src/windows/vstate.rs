@@ -186,7 +186,7 @@ impl Vm {
                 }));
                 devices::virtio::guest_commit::install(
                     super::lazy_mem::ensure_committed,
-                    super::lazy_mem::decommitted,
+                    super::lazy_mem::decommit,
                 );
                 String::new()
             }

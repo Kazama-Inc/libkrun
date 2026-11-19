@@ -851,24 +851,7 @@ fn clear_hinted_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len: u
 /// fault the guest, so the caller keeps its own policy.
 #[cfg(target_os = "windows")]
 fn windows_decommit(host_addr: *mut u8, len: u64) -> bool {
-    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let lazy = *LAZY.get_or_init(|| {
-        !matches!(
-            std::env::var("SMOLVM_WHP_LAZY_RAM").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    });
-    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
-    if !lazy {
-        return false;
-    }
-    // SAFETY: the range lies inside the reserved guest RAM mapping this VMM
-    // owns; the guest does not use it while it is reported free.
-    let freed = unsafe { VirtualFree(host_addr.cast(), len as usize, MEM_DECOMMIT) != 0 };
-    if freed {
-        crate::virtio::guest_commit::decommitted(host_addr, len as usize);
-    }
-    freed
+    crate::virtio::guest_commit::decommit(host_addr, len as usize)
 }
 
 /// Whether free-page reports should give their pages back to the host now.

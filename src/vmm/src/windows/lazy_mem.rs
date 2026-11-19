@@ -15,13 +15,15 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Once, RwLock};
+use std::sync::{Mutex, Once, RwLock};
 
 use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS,
 };
-use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+};
 
 /// Commit granularity: one allocation-granularity block per fault keeps the
 /// exit count low (16 pages per exit) without committing much the guest did
@@ -46,7 +48,9 @@ struct Range {
     chunk: u64,
     populate: bool,
     /// One bit per chunk known to be committed, so [`ensure_committed`] can
-    /// skip the system call. A clear bit only means "maybe not committed".
+    /// skip the system call. A clear bit only means "maybe not committed"; a
+    /// set bit must mean the whole chunk is, so it changes only together with
+    /// the memory, under [`COMMIT_LOCK`].
     committed: &'static [AtomicU64],
 }
 
@@ -77,6 +81,15 @@ pub fn set_populate(populate: Populate) {
 }
 
 static RANGES: RwLock<Vec<Range>> = RwLock::new(Vec::new());
+
+/// Held while a chunk is committed and marked, or while pages are decommitted
+/// and their chunks unmarked. Without it a commit could mark a chunk after a
+/// concurrent decommit had cleared it: the bit would claim the chunk is
+/// committed while a page in it is not, [`ensure_committed`] would skip it, and
+/// the host's next `recv` or `ReadFile` into that page would fail. The lock is
+/// only held across the system call, which never touches guest memory, so the
+/// vectored exception handler can take it too.
+static COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Whether guest RAM, not only device windows, is reserved and committed on
 /// first touch (the default; `SMOLVM_WHP_LAZY_RAM=0` commits it all up front
@@ -139,6 +152,7 @@ fn commit(range: &Range, offset: u64) -> bool {
 fn commit_chunk(range: &Range, offset: u64) -> Option<(u64, u64)> {
     let chunk_start = offset & !(range.chunk - 1);
     let len = range.chunk.min(range.size - chunk_start);
+    let _commit = COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: the address lies inside a reservation this process owns, and
     // committing an already-committed page is a no-op that keeps its contents.
     let addr = unsafe {
@@ -183,25 +197,41 @@ pub fn ensure_committed(ptr: *const u8, len: usize) {
     }
 }
 
-/// Forget that the chunks overlapping `[ptr, ptr + len)` are committed: the
-/// balloon decommitted (part of) them.
-pub fn decommitted(ptr: *const u8, len: usize) {
+/// Decommit `[ptr, ptr + len)` of guest RAM and forget that the chunks
+/// overlapping it are committed; the guest's next touch commits it again as
+/// zeros. For pages the balloon was told are free. Returns whether the range
+/// was decommitted.
+///
+/// Only RAM registered here is decommitted. Guest memory outside it (the
+/// kernel image region, committed up front) has no path to be committed again:
+/// a guest touch would find no range, fall through to the MMIO emulator and
+/// fault, and a host touch would be an unhandled access violation. The guest
+/// frees and reports such pages too (its init memory once it has booted), so
+/// they are refused and the caller keeps its own policy for them.
+pub fn decommit(ptr: *const u8, len: usize) -> bool {
     let (start, end) = (ptr as u64, ptr as u64 + len as u64);
     let Ok(ranges) = RANGES.read() else {
-        return;
+        return false;
     };
-    for range in ranges
+    let Some(range) = ranges
         .iter()
-        .filter(|r| start < r.host + r.size && end > r.host)
-    {
-        let from = start.max(range.host) - range.host;
-        let to = end.min(range.host + range.size) - range.host;
-        let mut chunk = from & !(range.chunk - 1);
-        while chunk < to {
-            range.mark(chunk, false);
-            chunk += range.chunk;
-        }
+        .find(|r| r.populate && start >= r.host && end <= r.host + r.size)
+    else {
+        return false;
+    };
+    let _commit = COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the range lies in guest RAM this VMM reserved, which the guest
+    // does not use while it is reported free.
+    if unsafe { VirtualFree(ptr as *mut c_void, len, MEM_DECOMMIT) } == 0 {
+        return false;
     }
+    let (from, to) = (start - range.host, end - range.host);
+    let mut chunk = from & !(range.chunk - 1);
+    while chunk < to {
+        range.mark(chunk, false);
+        chunk += range.chunk;
+    }
+    true
 }
 
 /// Called on a `MemoryAccess` exit for a mapped GPA: if the GPA lies in a
