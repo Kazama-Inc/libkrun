@@ -25,6 +25,7 @@
 | `feat/windows-virtiofs-host-owner`（叠在 `fix/windows-virtiofs-escapes` 上） | `krun_add_virtiofs4` 新 flag `KRUN_VIRTIOFS_FLAG_HOST_OWNER`（`1 << 3`）：Windows 上没有记录属主的文件报 uid/gid 1000（`KRUN_VIRTIOFS_HOST_OWNER`）而不是 root，guest 才能把共享映射给非 root 工作负载。只给用户文件的共享用，镜像树不用；Linux、macOS 忽略 | 暂不提上游 |
 | `feat/whp-lazy-guest-ram` | Windows（WHP）的 guest RAM 先保留不提交，guest 第一次碰到时按 2 MiB 提交，并用 `WHvAdviseGpaRange` 预填这一块（原来开机就按上限整块提交，再整块预填）；balloon 报告的空闲页直接 decommit，归还提交额度；主机内核态 I/O 之前先提交要用的 virtio 缓冲区（`descriptor_utils`、vsock 包）。默认开，`SMOLVM_WHP_LAZY_RAM=0` 恢复原行为 | 暂不提上游 |
 | `fix/whp-lazy-ram-decommit`（叠在 `feat/whp-lazy-guest-ram` 上） | 按需提交模式下 balloon 只回收已登记的按需提交 RAM：原来 guest 上报的空闲页一律 decommit，包括开机整块提交的内核镜像区（16 MiB～约 36 MiB，guest 启动后释放 init 内存并上报），这些页回收后没有路径再提交，guest 再用时落进 MMIO 模拟器，`rep stosb` 被模拟坏导致 guest 内核 oops（dpkg / apt 被杀、VM 无响应），主机侧碰到则 VMM 退出。同时提交与回收改在同一把锁里改内存和位图，免得位图标「已提交」而页其实已回收。集成测试 `tests/windows_lazy_mem.rs` | 暂不提上游 |
+| `fix/kernel-cmdline-env-error` | 拼内核命令行（prolog、调用方的 guest 环境变量、epilog）失败时 `krun_start_enter` 返回错误（`Invalid kernel command line: …`），不再在 C 入口里 `unwrap` panic：调用方传了带非 ASCII 的环境变量值或总长超限时，Windows 上进程原来以 0xC0000409 中止 | 暂不提上游 |
 
 ## 构建（Windows，MSVC）
 
